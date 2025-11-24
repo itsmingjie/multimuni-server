@@ -125,28 +125,34 @@ async function pushOnce() {
   const allVisits = visitArrays.flat();
   const payload = transformVisits(allVisits);
 
+  // FIX: TRMNL requires merge_variables wrapper
+  const trmnlPayload = {
+    merge_variables: payload
+  };
+
   try {
     const res = await fetch(WEBHOOK_URL, {
       method: "POST",
       headers: {
         "Content-Type": "application/json"
       },
-      body: JSON.stringify(payload)
+      body: JSON.stringify(trmnlPayload)
     });
 
-    const txt = await res.text();
+    const text = await res.text();
     if (!res.ok) {
-      console.error("Webhook error:", res.status, txt);
-      return { ok: false, status: res.status, body: txt };
+      console.error("Webhook error:", res.status, text);
+      return { ok: false, status: res.status, body: text };
     }
 
     console.log("Webhook push OK", new Date().toISOString());
     return { ok: true };
   } catch (err) {
-    console.error("Webhook push exception:", err);
+    console.error("Webhook exception:", err);
     return { ok: false, error: err.message };
   }
 }
+
 
 // ----------------------------------------------------------------------
 // NEW: Force push endpoint
