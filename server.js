@@ -4,13 +4,13 @@ const app = express();
 app.use(express.json());
 
 const API_KEY = process.env.API_KEY;
-const STOPS = process.env.STOPS; // "SF:14609,SF:14608,GG:40033"
-const WEBHOOK_URL = process.env.WEBHOOK_URL; // TRMNL merge_variables endpoint
+const STOPS = process.env.STOPS; // Example: "SF:14609,SF:14608,GG:40033"
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
 const FREQUENCY_MINUTES = parseInt(process.env.FREQUENCY_MINUTES || "5", 10);
 
-/* ---------------------------------------------------
-   Helper: fetch all operators in parallel
---------------------------------------------------- */
+/* ----------------------------------------------
+   Fetch per operator+stop
+---------------------------------------------- */
 async function fetchOperator(operator, stopCode) {
   const url =
     `https://api.511.org/transit/StopMonitoring` +
@@ -23,101 +23,92 @@ async function fetchOperator(operator, stopCode) {
     const res = await fetch(url);
     const json = await res.json();
     return json?.ServiceDelivery?.StopMonitoringDelivery?.MonitoredStopVisit || [];
-  } catch (e) {
-    console.error("Error fetching operator:", operator, e);
+  } catch {
     return [];
   }
 }
 
-/* ---------------------------------------------------
-   Helper: flatten & normalize MVJ objects
---------------------------------------------------- */
-function normalizeResults(visits) {
-  const results = [];
+/* ----------------------------------------------
+   Normalize down to minimal shape
+---------------------------------------------- */
+function slim(visits) {
+  const result = [];
 
   for (const v of visits) {
     const mvj = v.MonitoredVehicleJourney;
-    if (!mvj || !mvj.MonitoredCall) continue;
+    if (!mvj?.MonitoredCall) continue;
 
     const call = mvj.MonitoredCall;
 
-    results.push({
-      operator: mvj.OperatorRef,                          // "SF" or "GG"
-      line: mvj.LineRef || mvj.PublishedLineName || "?",  // always something
-      destination: call.DestinationDisplay || "?",        // always something
-      stopRef: call.StopPointRef,
-      stopName: call.StopPointName,
-      aimed: call.AimedDepartureTime || call.AimedArrivalTime,
-      expected: call.ExpectedDepartureTime || call.ExpectedArrivalTime,
+    result.push({
+      operator: mvj.OperatorRef,
+      line: mvj.LineRef || mvj.PublishedLineName || "?",
+      destination: call.DestinationDisplay || "?",
+      expected: call.ExpectedDepartureTime || call.ExpectedArrivalTime
     });
   }
 
-  return results;
+  return result;
 }
 
-/* ---------------------------------------------------
-   Helper: build "lines" summary section
-   (Next soonest departure per (operator,line))
---------------------------------------------------- */
-function buildLines(departures) {
+/* ----------------------------------------------
+   Build bottom "lines" summary (one per operator+line)
+---------------------------------------------- */
+function buildLines(dep) {
   const bucket = {};
 
-  for (const d of departures) {
-    if (!d.operator || !d.line) continue;
-
+  for (const d of dep) {
     const key = `${d.operator}:${d.line}`;
-
     if (!bucket[key]) bucket[key] = [];
     bucket[key].push(d);
   }
 
-  // Keep the earliest for each line
-  const lines = Object.values(bucket).map(list =>
-    list.sort((a, b) => new Date(a.expected) - new Date(b.expected))[0]
-  );
-
-  // Sort globally
-  return lines.sort((a, b) => new Date(a.expected) - new Date(b.expected));
+  // pick soonest departure per line
+  return Object.values(bucket)
+    .map(list => list.sort((a, b) => new Date(a.expected) - new Date(b.expected))[0])
+    .sort((a, b) => new Date(a.expected) - new Date(b.expected));
 }
 
-/* ---------------------------------------------------
-   Main: refresh function
---------------------------------------------------- */
+/* ----------------------------------------------
+   PUSH LOGIC
+---------------------------------------------- */
 async function refreshAndPush() {
-  console.log("Refreshing…");
-
   const stopList = STOPS.split(",").map(s => s.trim());
-  const allVisits = [];
+  let all = [];
 
   for (const item of stopList) {
-    const [operator, stop] = item.split(":");
-    if (!operator || !stop) continue;
+    const [op, stop] = item.split(":");
+    if (!op || !stop) continue;
 
-    const visits = await fetchOperator(operator, stop);
-    const normalized = normalizeResults(visits);
-    allVisits.push(...normalized);
+    const visits = await fetchOperator(op, stop);
+    all.push(...slim(visits));
   }
 
-  // Sort departures
-  const departures = allVisits.sort(
-    (a, b) => new Date(a.expected) - new Date(b.expected)
-  );
+  // Sort by time
+  all = all.sort((a, b) => new Date(a.expected) - new Date(b.expected));
 
-  // Build lines array (ensures Muni + GGT both included)
-  const lines = buildLines(departures);
+  // Minimal payload: next 3 + line summaries
+  const next3 = all.slice(0, 3);
+  const lines = buildLines(all);
 
-  // Payload to TRMNL
   const payload = {
-    merge_variables: {
-      departures,
-      lines
-    },
+    merge_variables: { next3, lines },
     merge_strategy: "replace"
   };
 
-  console.log("Pushing to TRMNL:", JSON.stringify(payload, null, 2));
+  // Enforce 2 KB
+  const size = Buffer.byteLength(JSON.stringify(payload), "utf8");
+  console.log("Payload size:", size, "bytes");
+  if (size > 2000) {
+    console.error("OVER 2KB, trimming…");
 
-  // Send POST to webhook
+    // Emergency trim: cut destinations + slice lines
+    next3.forEach(d => { d.destination = d.destination.slice(0, 12); });
+    while (Buffer.byteLength(JSON.stringify(payload), "utf8") > 2000 && lines.length > 4)
+      lines.pop();
+  }
+
+  // Push to TRMNL
   try {
     const res = await fetch(WEBHOOK_URL, {
       method: "POST",
@@ -125,38 +116,21 @@ async function refreshAndPush() {
       body: JSON.stringify(payload)
     });
 
-    const text = await res.text();
-    if (!res.ok) {
-      console.error("Webhook error:", res.status, text);
-    } else {
-      console.log("Webhook push success:", text);
-    }
+    const txt = await res.text();
+    console.log("Push result:", res.status, txt);
   } catch (e) {
-    console.error("Webhook POST failed:", e);
+    console.error("Webhook push failed:", e);
   }
 }
 
-/* ---------------------------------------------------
-   Express Routes
---------------------------------------------------- */
-app.get("/", (req, res) => {
-  res.send("Multimuni Webhook Pusher running.");
-});
-
-// Force push endpoint
+/* ---------------------------------------------- */
 app.post("/push", async (req, res) => {
   await refreshAndPush();
-  res.send({ status: "ok", forced: true });
+  res.send({ ok: true });
 });
 
-/* ---------------------------------------------------
-   Interval timer
---------------------------------------------------- */
-setInterval(refreshAndPush, FREQUENCY_MINUTES * 60 * 1000);
-console.log("Server started");
-refreshAndPush(); // initial trigger
+/* ---------------------------------------------- */
+setInterval(refreshAndPush, FREQUENCY_MINUTES * 60000);
+refreshAndPush();
 
-/* --------------------------------------------------- */
-app.listen(8080, () => {
-  console.log("Listening on :8080");
-});
+app.listen(8080, () => console.log("Server running"));
