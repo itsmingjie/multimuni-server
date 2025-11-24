@@ -4,111 +4,69 @@ const app = express();
 app.use(express.json());
 
 const API_KEY = process.env.API_KEY;
-const STOPS = process.env.STOPS; // Example: "SF:14609,SF:14608,GG:40033"
+const STOPS = process.env.STOPS; // "SF:14608,SF:14609,GG:40033"
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
-const FREQUENCY_MINUTES = parseInt(process.env.FREQUENCY_MINUTES || "5", 10);
+const FREQUENCY_MINUTES = Number(process.env.FREQUENCY_MINUTES || 5);
 
-/* ----------------------------------------------
-   Fetch per operator+stop
----------------------------------------------- */
-async function fetchOperator(operator, stopCode) {
-  const url =
-    `https://api.511.org/transit/StopMonitoring` +
-    `?api_key=${API_KEY}` +
-    `&agency=${operator}` +
-    `&stopcode=${stopCode}` +
-    `&format=json`;
+if (!API_KEY || !STOPS || !WEBHOOK_URL) {
+  console.error("Missing env vars: API_KEY, STOPS, WEBHOOK_URL required.");
+  process.exit(1);
+}
 
+function parseStops(raw) {
+  return raw.split(",").map(s => {
+    const [op, stop] = s.trim().split(":");
+    return { operator: op, stopCode: stop };
+  });
+}
+
+async function fetchStop(op, stopCode) {
   try {
+    const url = `https://api.511.org/transit/StopMonitoring?api_key=${API_KEY}&agency=${op}&stopcode=${stopCode}&format=json`;
     const res = await fetch(url);
-    const json = await res.json();
-    return json?.ServiceDelivery?.StopMonitoringDelivery?.MonitoredStopVisit || [];
-  } catch {
-    return [];
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (e) {
+    console.error("Fetch error:", op, stopCode, e);
+    return null;
   }
 }
 
-/* ----------------------------------------------
-   Normalize down to minimal shape
----------------------------------------------- */
-function slim(visits) {
-  const result = [];
-
-  for (const v of visits) {
-    const mvj = v.MonitoredVehicleJourney;
-    if (!mvj?.MonitoredCall) continue;
-
-    const call = mvj.MonitoredCall;
-
-    result.push({
-      operator: mvj.OperatorRef,
-      line: mvj.LineRef || mvj.PublishedLineName || "?",
-      destination: call.DestinationDisplay || "?",
-      expected: call.ExpectedDepartureTime || call.ExpectedArrivalTime
-    });
-  }
-
-  return result;
+function extractDepartures(raw) {
+  if (!raw?.ServiceDelivery?.StopMonitoringDelivery?.MonitoredStopVisit) return [];
+  return raw.ServiceDelivery.StopMonitoringDelivery.MonitoredStopVisit.map(v => {
+    const mvj = v.MonitoredVehicleJourney ?? {};
+    const mc = mvj.MonitoredCall ?? {};
+    return {
+      line: mvj.LineRef || mvj.PublishedLineName || null,
+      destination: mc.DestinationDisplay || mvj.DestinationName || "",
+      expected: mc.ExpectedArrivalTime || mc.AimedArrivalTime,
+      operator: mvj.OperatorRef || null
+    };
+  }).filter(d => d.expected && d.line);
 }
 
-/* ----------------------------------------------
-   Build bottom "lines" summary (one per operator+line)
----------------------------------------------- */
-function buildLines(dep) {
-  const bucket = {};
-
-  for (const d of dep) {
-    const key = `${d.operator}:${d.line}`;
-    if (!bucket[key]) bucket[key] = [];
-    bucket[key].push(d);
-  }
-
-  // pick soonest departure per line
-  return Object.values(bucket)
-    .map(list => list.sort((a, b) => new Date(a.expected) - new Date(b.expected))[0])
-    .sort((a, b) => new Date(a.expected) - new Date(b.expected));
+function pruneDestination(name = "") {
+  // Shorten big GGT names
+  return name
+    .replace("San Francisco ", "")
+    .replace("Salesforce Transit Center", "Salesforce TC")
+    .trim();
 }
 
-/* ----------------------------------------------
-   PUSH LOGIC
----------------------------------------------- */
-async function refreshAndPush() {
-  const stopList = STOPS.split(",").map(s => s.trim());
-  let all = [];
+function compactify(list) {
+  return list.map(d => ({
+    line: d.line,
+    destination: pruneDestination(d.destination),
+    expected: d.expected
+  }));
+}
 
-  for (const item of stopList) {
-    const [op, stop] = item.split(":");
-    if (!op || !stop) continue;
-
-    const visits = await fetchOperator(op, stop);
-    all.push(...slim(visits));
-  }
-
-  // Sort by time
-  all = all.sort((a, b) => new Date(a.expected) - new Date(b.expected));
-
-  // Minimal payload: next 3 + line summaries
-  const next3 = all.slice(0, 3);
-  const lines = buildLines(all);
-
+async function pushToWebhook(data) {
   const payload = {
-    merge_variables: { next3, lines },
-    merge_strategy: "replace"
+    merge_variables: data
   };
 
-  // Enforce 2 KB
-  const size = Buffer.byteLength(JSON.stringify(payload), "utf8");
-  console.log("Payload size:", size, "bytes");
-  if (size > 2000) {
-    console.error("OVER 2KB, trimming…");
-
-    // Emergency trim: cut destinations + slice lines
-    next3.forEach(d => { d.destination = d.destination.slice(0, 12); });
-    while (Buffer.byteLength(JSON.stringify(payload), "utf8") > 2000 && lines.length > 4)
-      lines.pop();
-  }
-
-  // Push to TRMNL
   try {
     const res = await fetch(WEBHOOK_URL, {
       method: "POST",
@@ -116,21 +74,48 @@ async function refreshAndPush() {
       body: JSON.stringify(payload)
     });
 
-    const txt = await res.text();
-    console.log("Push result:", res.status, txt);
+    if (!res.ok) {
+      const t = await res.text();
+      console.error("Webhook error:", res.status, t);
+    }
   } catch (e) {
     console.error("Webhook push failed:", e);
   }
 }
 
-/* ---------------------------------------------- */
-app.post("/push", async (req, res) => {
-  await refreshAndPush();
-  res.send({ ok: true });
+async function generateAndPush() {
+  const stops = parseStops(STOPS);
+
+  let all = [];
+  for (const s of stops) {
+    const json = await fetchStop(s.operator, s.stopCode);
+    const dep = extractDepartures(json);
+    all.push(...dep);
+  }
+
+  // Sort all departures globally
+  all.sort((a, b) => new Date(a.expected) - new Date(b.expected));
+
+  const next3 = compactify(all.slice(0, 3));
+
+  const muni = compactify(all.filter(d => d.operator === "SF").slice(0, 3));
+  const ggt  = compactify(all.filter(d => d.operator === "GG").slice(0, 3));
+
+  await pushToWebhook({
+    departures: next3,
+    lines_sf: muni,
+    lines_gg: ggt
+  });
+}
+
+// PUBLIC ENDPOINT TO TRIGGER PUSH
+app.get("/trigger", async (req, res) => {
+  await generateAndPush();
+  res.json({ ok: true });
 });
 
-/* ---------------------------------------------- */
-setInterval(refreshAndPush, FREQUENCY_MINUTES * 60000);
-refreshAndPush();
+// Start polling timer
+setInterval(generateAndPush, FREQUENCY_MINUTES * 60 * 1000);
 
-app.listen(8080, () => console.log("Server running"));
+// Start server
+app.listen(8080, () => console.log("Server running + webhook pusher active"));
