@@ -1,176 +1,162 @@
 import express from "express";
 
-const cache = {};
 const app = express();
 app.use(express.json());
 
-// ----------------------------------------------------------------------
-// ENV VARS
-// ----------------------------------------------------------------------
 const API_KEY = process.env.API_KEY;
-const STOPS = process.env.STOPS || "";
-const WEBHOOK_URL = process.env.WEBHOOK_URL;
-const FREQUENCY_MINUTES = parseInt(process.env.FREQUENCY_MINUTES || "1", 10);
+const STOPS = process.env.STOPS; // "SF:14609,SF:14608,GG:40033"
+const WEBHOOK_URL = process.env.WEBHOOK_URL; // TRMNL merge_variables endpoint
+const FREQUENCY_MINUTES = parseInt(process.env.FREQUENCY_MINUTES || "5", 10);
 
-// ----------------------------------------------------------------------
-// Helpers
-// ----------------------------------------------------------------------
-function parseStops(stopString) {
-  const operators = {};
-  stopString
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean)
-    .forEach(pair => {
-      const [op, stop] = pair.split(":");
-      if (!operators[op]) operators[op] = [];
-      operators[op].push(stop);
-    });
-  return operators;
-}
-
-async function cachedFetch(url) {
-  const now = Date.now();
-  const hit = cache[url];
-  if (hit && now - hit.timestamp < 60000) {
-    return hit.data;
-  }
-  const res = await fetch(url);
-  const json = await res.json();
-  cache[url] = { timestamp: now, data: json };
-  return json;
-}
-
-async function fetchOperator(operatorId, stops) {
-  const joined = stops.join(",");
-  const url = `https://api.511.org/transit/StopMonitoring?api_key=${API_KEY}&agency=${operatorId}&stopCode=${joined}&format=json`;
+/* ---------------------------------------------------
+   Helper: fetch all operators in parallel
+--------------------------------------------------- */
+async function fetchOperator(operator, stopCode) {
+  const url =
+    `https://api.511.org/transit/StopMonitoring` +
+    `?api_key=${API_KEY}` +
+    `&agency=${operator}` +
+    `&stopcode=${stopCode}` +
+    `&format=json`;
 
   try {
-    const data = await cachedFetch(url);
-    return (
-      data?.ServiceDelivery?.StopMonitoringDelivery?.MonitoredStopVisit || []
-    );
-  } catch (err) {
-    console.error("Batch fetch failed:", operatorId, err);
+    const res = await fetch(url);
+    const json = await res.json();
+    return json?.ServiceDelivery?.StopMonitoringDelivery?.MonitoredStopVisit || [];
+  } catch (e) {
+    console.error("Error fetching operator:", operator, e);
+    return [];
   }
-
-  // fallback per-stop
-  const perStop = await Promise.all(
-    stops.map(async stopCode => {
-      const u = `https://api.511.org/transit/StopMonitoring?api_key=${API_KEY}&agency=${operatorId}&stopCode=${stopCode}&format=json`;
-      try {
-        const d = await cachedFetch(u);
-        return (
-          d?.ServiceDelivery?.StopMonitoringDelivery?.MonitoredStopVisit || []
-        );
-      } catch (e) {
-        console.error("Single-stop failed:", operatorId, stopCode, e);
-        return [];
-      }
-    })
-  );
-
-  return perStop.flat();
 }
 
-function transformVisits(allVisits) {
-  const departures = allVisits
-    .map(v => {
-      const j = v?.MonitoredVehicleJourney;
-      const mc = j?.MonitoredCall;
-      if (!j || !mc) return null;
+/* ---------------------------------------------------
+   Helper: flatten & normalize MVJ objects
+--------------------------------------------------- */
+function normalizeResults(visits) {
+  const results = [];
 
-      const line =
-        j.LineRef ||
-        j.PublishedLineName ||
-        j.RouteRef ||
-        null;
+  for (const v of visits) {
+    const mvj = v.MonitoredVehicleJourney;
+    if (!mvj || !mvj.MonitoredCall) continue;
 
-      return {
-        stopRef: mc.StopPointRef || null,
-        stopName: mc.StopPointName || null,
-        destination: mc.DestinationDisplay || null,
-        line,
-        aimed: mc.AimedArrivalTime || null,
-        expected: mc.ExpectedArrivalTime || mc.AimedArrivalTime || null
-      };
-    })
-    .filter(Boolean)
-    .sort(
-      (a, b) =>
-        new Date(a.expected).getTime() -
-        new Date(b.expected).getTime()
-    );
+    const call = mvj.MonitoredCall;
 
-  const lines = Array.from(
-    new Set(departures.map(d => d.line).filter(Boolean))
-  ).map(line => ({ line }));
-
-  return { departures, lines };
-}
-
-async function pushOnce() {
-  if (!API_KEY || !WEBHOOK_URL || !STOPS) {
-    console.error("Missing env vars");
-    return { ok: false, error: "Missing env vars" };
+    results.push({
+      operator: mvj.OperatorRef,                          // "SF" or "GG"
+      line: mvj.LineRef || mvj.PublishedLineName || "?",  // always something
+      destination: call.DestinationDisplay || "?",        // always something
+      stopRef: call.StopPointRef,
+      stopName: call.StopPointName,
+      aimed: call.AimedDepartureTime || call.AimedArrivalTime,
+      expected: call.ExpectedDepartureTime || call.ExpectedArrivalTime,
+    });
   }
 
-  const operators = parseStops(STOPS);
-  const visitArrays = await Promise.all(
-    Object.entries(operators).map(([op, stops]) =>
-      fetchOperator(op, stops)
-    )
+  return results;
+}
+
+/* ---------------------------------------------------
+   Helper: build "lines" summary section
+   (Next soonest departure per (operator,line))
+--------------------------------------------------- */
+function buildLines(departures) {
+  const bucket = {};
+
+  for (const d of departures) {
+    if (!d.operator || !d.line) continue;
+
+    const key = `${d.operator}:${d.line}`;
+
+    if (!bucket[key]) bucket[key] = [];
+    bucket[key].push(d);
+  }
+
+  // Keep the earliest for each line
+  const lines = Object.values(bucket).map(list =>
+    list.sort((a, b) => new Date(a.expected) - new Date(b.expected))[0]
   );
 
-  const allVisits = visitArrays.flat();
-  const payload = transformVisits(allVisits);
+  // Sort globally
+  return lines.sort((a, b) => new Date(a.expected) - new Date(b.expected));
+}
 
-  // FIX: TRMNL requires merge_variables wrapper
-  const trmnlPayload = {
-    merge_variables: payload
+/* ---------------------------------------------------
+   Main: refresh function
+--------------------------------------------------- */
+async function refreshAndPush() {
+  console.log("Refreshing…");
+
+  const stopList = STOPS.split(",").map(s => s.trim());
+  const allVisits = [];
+
+  for (const item of stopList) {
+    const [operator, stop] = item.split(":");
+    if (!operator || !stop) continue;
+
+    const visits = await fetchOperator(operator, stop);
+    const normalized = normalizeResults(visits);
+    allVisits.push(...normalized);
+  }
+
+  // Sort departures
+  const departures = allVisits.sort(
+    (a, b) => new Date(a.expected) - new Date(b.expected)
+  );
+
+  // Build lines array (ensures Muni + GGT both included)
+  const lines = buildLines(departures);
+
+  // Payload to TRMNL
+  const payload = {
+    merge_variables: {
+      departures,
+      lines
+    },
+    merge_strategy: "replace"
   };
 
+  console.log("Pushing to TRMNL:", JSON.stringify(payload, null, 2));
+
+  // Send POST to webhook
   try {
     const res = await fetch(WEBHOOK_URL, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(trmnlPayload)
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
     });
 
     const text = await res.text();
     if (!res.ok) {
       console.error("Webhook error:", res.status, text);
-      return { ok: false, status: res.status, body: text };
+    } else {
+      console.log("Webhook push success:", text);
     }
-
-    console.log("Webhook push OK", new Date().toISOString());
-    return { ok: true };
-  } catch (err) {
-    console.error("Webhook exception:", err);
-    return { ok: false, error: err.message };
+  } catch (e) {
+    console.error("Webhook POST failed:", e);
   }
 }
 
-
-// ----------------------------------------------------------------------
-// NEW: Force push endpoint
-// ----------------------------------------------------------------------
-app.post("/force-push", async (req, res) => {
-  console.log("Manual force push triggered");
-  const result = await pushOnce();
-  res.json(result);
+/* ---------------------------------------------------
+   Express Routes
+--------------------------------------------------- */
+app.get("/", (req, res) => {
+  res.send("Multimuni Webhook Pusher running.");
 });
 
-// ----------------------------------------------------------------------
-// Scheduler
-// ----------------------------------------------------------------------
-setInterval(pushOnce, FREQUENCY_MINUTES * 60 * 1000);
-pushOnce(); // immediate on boot
+// Force push endpoint
+app.post("/push", async (req, res) => {
+  await refreshAndPush();
+  res.send({ status: "ok", forced: true });
+});
 
-// Dummy listener so Coolify keeps service alive
-app.get("/", (req, res) => res.send("Multimuni Webhook Push running"));
-app.listen(process.env.PORT || 8080, () =>
-  console.log("Server started")
-);
+/* ---------------------------------------------------
+   Interval timer
+--------------------------------------------------- */
+setInterval(refreshAndPush, FREQUENCY_MINUTES * 60 * 1000);
+console.log("Server started");
+refreshAndPush(); // initial trigger
+
+/* --------------------------------------------------- */
+app.listen(8080, () => {
+  console.log("Listening on :8080");
+});
