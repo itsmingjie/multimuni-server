@@ -1,201 +1,184 @@
 import express from "express";
+import fetch from "node-fetch";
 
+// In-memory cache: { key: { timestamp, data } }
+const cache = {};
 const app = express();
-app.use(express.json());
 
-// Request logging middleware
-app.use((req, res, next) => {
-    const start = Date.now();
-    const method = req.method;
-    const path = req.path;
-    
-    // Log incoming request with snippet
-    const reqSnippet = JSON.stringify(req.body).substring(0, 100);
-    console.log(`[${new Date().toISOString()}] → ${method} ${path} | Body: ${reqSnippet}`);
-    
-    // Intercept response
-    const originalJson = res.json.bind(res);
-    res.json = function(data) {
-        const duration = Date.now() - start;
-        const resSnippet = JSON.stringify(data).substring(0, 100);
-        console.log(`[${new Date().toISOString()}] ← ${method} ${path} | ${res.statusCode} (${duration}ms) | Response: ${resSnippet}`);
-        return originalJson(data);
-    };
-    
-    next();
-});
+// ----------------------------------------------------------------------
+// ENVIRONMENT VARIABLES
+// ----------------------------------------------------------------------
+const API_KEY = process.env.API_KEY;
+const STOPS = process.env.STOPS || "";
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+const FREQUENCY_MINUTES = parseInt(process.env.FREQUENCY_MINUTES || "1", 10);
 
-// ------------------------------------------------------
-// 10-second simple cache
-// ------------------------------------------------------
-const cache = new Map();
-const CACHE_TTL = 10 * 1000; // 10 seconds
-
-function makeCacheKey(apiKey, operators) {
-    return `${apiKey}:${operators.sort().join(",")}`;
+// ----------------------------------------------------------------------
+// PARSE STOP LIST
+// Example: "SF:14609,SF:14608,GG:40033"
+// => { SF: ["14609","14608"], GG: ["40033"] }
+// ----------------------------------------------------------------------
+function parseStops(stopString) {
+  const operators = {};
+  stopString
+    .split(",")
+    .map(s => s.trim())
+    .filter(Boolean)
+    .forEach(pair => {
+      const [op, stop] = pair.split(":");
+      if (!operators[op]) operators[op] = [];
+      operators[op].push(stop);
+    });
+  return operators;
 }
 
-function getCache(key) {
-    const entry = cache.get(key);
-    if (!entry) return null;
-    if (Date.now() - entry.timestamp > CACHE_TTL) {
-        cache.delete(key);
-        return null;
-    }
-    return entry.data;
+// ----------------------------------------------------------------------
+// CACHED FETCH (60 seconds)
+// ----------------------------------------------------------------------
+async function cachedFetch(url) {
+  const now = Date.now();
+  const hit = cache[url];
+
+  if (hit && now - hit.timestamp < 60000) {
+    return hit.data;
+  }
+
+  const res = await fetch(url);
+  const json = await res.json();
+
+  cache[url] = { timestamp: now, data: json };
+  return json;
 }
 
-function setCache(key, value) {
-    cache.set(key, { timestamp: Date.now(), data: value });
+// ----------------------------------------------------------------------
+// FETCH A SINGLE OPERATOR (ALL STOPS AT ONCE)
+// Using fallback: SFMTA uses &stopCode=, GGT uses &stopCode=
+// If operator requires per-stop calls, fallback to multi-call
+// ----------------------------------------------------------------------
+async function fetchOperator(operatorId, stops) {
+  const joined = stops.join(",");
+
+  const url = `https://api.511.org/transit/StopMonitoring?api_key=${API_KEY}&agency=${operatorId}&stopCode=${joined}&format=json`;
+
+  try {
+    const data = await cachedFetch(url);
+    const visits =
+      data?.ServiceDelivery?.StopMonitoringDelivery?.MonitoredStopVisit || [];
+    return visits;
+  } catch (err) {
+    console.error("Operator fetch failed, falling back per-stop", operatorId, err);
+  }
+
+  // Fallback: fetch each stop individually
+  const perStop = await Promise.all(
+    stops.map(async stopCode => {
+      const u = `https://api.511.org/transit/StopMonitoring?api_key=${API_KEY}&agency=${operatorId}&stopCode=${stopCode}&format=json`;
+      try {
+        const d = await cachedFetch(u);
+        return (
+          d?.ServiceDelivery?.StopMonitoringDelivery?.MonitoredStopVisit || []
+        );
+      } catch (e) {
+        console.error("Single stop failed", operatorId, stopCode, e);
+        return [];
+      }
+    })
+  );
+
+  return perStop.flat();
 }
 
-// ------------------------------------------------------
-// Fetch StopMonitoring for one operator
-// ------------------------------------------------------
-async function fetchOperator(apiKey, operatorId) {
-    const url =
-        `https://api.511.org/transit/StopMonitoring?api_key=${apiKey}` +
-        `&agency=${operatorId}&format=json`;
+// ----------------------------------------------------------------------
+// BUILD FINAL UNIVERSAL PAYLOAD { departures: [], lines: [] }
+// ----------------------------------------------------------------------
+function transformVisits(allVisits) {
+  const departures = allVisits
+    .map(v => {
+      const j = v?.MonitoredVehicleJourney;
+      const mc = j?.MonitoredCall;
+      if (!j || !mc) return null;
 
-    const res = await fetch(url);
+      const line =
+        j.LineRef ||
+        j.PublishedLineName ||
+        j.RouteRef ||
+        null;
+
+      return {
+        stopRef: mc.StopPointRef || null,
+        stopName: mc.StopPointName || null,
+        destination: mc.DestinationDisplay || null,
+        line,
+        aimed: mc.AimedArrivalTime || null,
+        expected: mc.ExpectedArrivalTime || mc.AimedArrivalTime || null
+      };
+    })
+    .filter(Boolean)
+    .sort(
+      (a, b) =>
+        new Date(a.expected).getTime() -
+        new Date(b.expected).getTime()
+    );
+
+  const lines = Array.from(
+    new Set(departures.map(d => d.line).filter(Boolean))
+  ).map(line => ({ line }));
+
+  return { departures, lines };
+}
+
+// ----------------------------------------------------------------------
+// PUSH TO WEBHOOK
+// ----------------------------------------------------------------------
+async function pushToWebhook() {
+  console.log("Running scheduled update...");
+
+  if (!API_KEY || !WEBHOOK_URL || !STOPS) {
+    console.error("Missing required env vars (API_KEY, WEBHOOK_URL, STOPS)");
+    return;
+  }
+
+  const operators = parseStops(STOPS);
+
+  // Fetch all operators
+  const visitArrays = await Promise.all(
+    Object.entries(operators).map(([op, stops]) =>
+      fetchOperator(op, stops)
+    )
+  );
+
+  const allVisits = visitArrays.flat();
+  const payload = transformVisits(allVisits);
+
+  try {
+    const res = await fetch(WEBHOOK_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(payload)
+    });
 
     if (!res.ok) {
-        console.warn(`511 API error for operator ${operatorId}:`, res.status);
-        return [];
+      console.error("Webhook push failed:", res.status, await res.text());
+    } else {
+      console.log("Webhook push OK", new Date().toISOString());
     }
-
-    let json;
-    try {
-        json = await res.json();
-    } catch (err) {
-        console.warn("JSON parse failed:", err);
-        return [];
-    }
-
-    return (
-        json?.ServiceDelivery?.StopMonitoringDelivery?.MonitoredStopVisit || []
-    );
+  } catch (err) {
+    console.error("Webhook push error:", err);
+  }
 }
 
-// ------------------------------------------------------
-// POST /screen — TRMNL-compatible data
-// ------------------------------------------------------
-app.post("/screen", async (req, res) => {
-    try {
-        const { api_key, stops } = req.body;
+// ----------------------------------------------------------------------
+// SCHEDULED RUNNER (no HTTP routes needed)
+// ----------------------------------------------------------------------
+setInterval(pushToWebhook, FREQUENCY_MINUTES * 60 * 1000);
 
-        if (!api_key || !stops) {
-            return res.status(400).json({
-                error: "Missing required fields: api_key and stops"
-            });
-        }
+// Run immediately at boot
+pushToWebhook();
 
-        // Parse input list like: "SF:14609,SF:14608,GG:40033"
-        const parsed = stops.split(",").map(s => s.trim());
-
-        const operatorToStops = {};
-        parsed.forEach(item => {
-            const [op, stop] = item.split(":");
-            if (!operatorToStops[op]) operatorToStops[op] = [];
-            operatorToStops[op].push(stop);
-        });
-
-        const operators = Object.keys(operatorToStops);
-        const cacheKey = makeCacheKey(api_key, operators);
-
-        // --------------------------------------------------
-        // Use cached results if available
-        // --------------------------------------------------
-        const cached = getCache(cacheKey);
-        if (cached) {
-            console.log(`[${new Date().toISOString()}] Cache HIT for operators: ${operators.join(", ")}`);
-            return res.json(cached);
-        }
-        console.log(`[${new Date().toISOString()}] Cache MISS - fetching data for operators: ${operators.join(", ")}`);
-
-        // --------------------------------------------------
-        // Fetch data per operator (1 request per agency)
-        // --------------------------------------------------
-        let allVisits = [];
-
-        for (const op of operators) {
-            const rawVisits = await fetchOperator(api_key, op);
-            const allowedStops = operatorToStops[op];
-
-            const filtered = rawVisits.filter(v => {
-                const stopRef =
-                    v?.MonitoredVehicleJourney?.MonitoredCall?.StopPointRef;
-                return stopRef && allowedStops.includes(stopRef);
-            });
-
-            allVisits.push(...filtered);
-        }
-
-        // --------------------------------------------------
-        // Transform into minimal clean structure
-        // --------------------------------------------------
-        const departures = allVisits
-            .map(v => {
-                const journey = v?.MonitoredVehicleJourney;
-                const mc = journey?.MonitoredCall;
-                if (!journey || !mc) return null;
-
-                const line =
-                    journey.LineRef ??
-                    journey.PublishedLineName ??
-                    journey.RouteRef ??
-                    null;
-
-                return {
-                    stopRef: mc.StopPointRef || null,
-                    stopName: mc.StopPointName || null,
-                    destination: mc.DestinationDisplay || null,
-                    line,
-                    aimed: mc.AimedArrivalTime || null,
-                    expected: mc.ExpectedArrivalTime || mc.AimedArrivalTime || null
-                };
-            })
-            .filter(Boolean)
-            .sort(
-                (a, b) =>
-                    new Date(a.expected).getTime() -
-                    new Date(b.expected).getTime()
-            );
-
-        // --------------------------------------------------
-        // Compute unique lines list
-        // --------------------------------------------------
-        const seen = new Set();
-        const lines = [];
-
-        for (const d of departures) {
-            if (!d.line) continue;
-            if (seen.has(d.line)) continue;
-
-            lines.push({
-                line: d.line,
-                destination: d.destination,
-                expected: d.expected
-            });
-
-            seen.add(d.line);
-        }
-
-        // Final TRMNL output shape
-        const output = { departures, lines };
-
-        setCache(cacheKey, output);
-        return res.json(output);
-    } catch (err) {
-        console.error("Server error:", err);
-        return res.status(500).json({ error: "Internal server error" });
-    }
-});
-
-// ------------------------------------------------------
-// Start server
-// ------------------------------------------------------
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-    console.log(`MultiMuni server listening on port ${PORT}`);
+// Dummy listener so Coolify marks service as “running”
+app.get("/", (req, res) => res.send("Multimuni Webhook Push running"));
+app.listen(process.env.PORT || 8080, () => {
+  console.log("Server started");
 });
