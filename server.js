@@ -3,6 +3,28 @@ import express from "express";
 const app = express();
 app.use(express.json());
 
+// Request logging middleware
+app.use((req, res, next) => {
+    const start = Date.now();
+    const method = req.method;
+    const path = req.path;
+    
+    // Log incoming request with snippet
+    const reqSnippet = JSON.stringify(req.body).substring(0, 100);
+    console.log(`[${new Date().toISOString()}] → ${method} ${path} | Body: ${reqSnippet}`);
+    
+    // Intercept response
+    const originalJson = res.json.bind(res);
+    res.json = function(data) {
+        const duration = Date.now() - start;
+        const resSnippet = JSON.stringify(data).substring(0, 100);
+        console.log(`[${new Date().toISOString()}] ← ${method} ${path} | ${res.statusCode} (${duration}ms) | Response: ${resSnippet}`);
+        return originalJson(data);
+    };
+    
+    next();
+});
+
 // ------------------------------------------------------
 // 10-second simple cache
 // ------------------------------------------------------
@@ -86,8 +108,10 @@ app.post("/screen", async (req, res) => {
         // --------------------------------------------------
         const cached = getCache(cacheKey);
         if (cached) {
+            console.log(`[${new Date().toISOString()}] Cache HIT for operators: ${operators.join(", ")}`);
             return res.json(cached);
         }
+        console.log(`[${new Date().toISOString()}] Cache MISS - fetching data for operators: ${operators.join(", ")}`);
 
         // --------------------------------------------------
         // Fetch data per operator (1 request per agency)
